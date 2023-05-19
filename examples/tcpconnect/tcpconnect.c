@@ -4,13 +4,24 @@
 #include "bpf/bpf_helpers.h"
 #include "bpf/bpf_core_read.h"
 #include "bpf/bpf_tracing.h"
+#include <bpf/bpf_endian.h>
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
 struct dimensions_t {
-	ipv4_addr saddr;
+	ipv4_addr saddr; // comment by mauricio on type
 	ipv4_addr daddr;
+	u16 dport;
+	u64 mnt_ns_id;
 } __attribute__((packed));
+
+// this describes how the events are printed in user space
+char __event_meta[] SEC("columns_format") = "\n\
+saddr='saddr,template:ipaddr,order:1000'\n\
+daddr='daddr,template:ipaddr,order:1000'\n\
+dport='dport,template:ipport,order:1000'\n\
+mnt_ns_id='mnt_ns_id,hide'\n\
+";
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -31,17 +42,30 @@ struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 1 << 24);
 	__type(value, struct dimensions_t);
-} counter_events_ring SEC(".maps");
+} print_events_ring SEC(".maps");
+
+// TODO: use function from  IG instead of defining it again
+// gadget_get_mntns_id returns the mntns_id of the current task.
+static __always_inline __u64 gadget_get_mntns_id() {
+	struct task_struct *task;
+	__u64 mntns_id;
+
+	task = (struct task_struct*) bpf_get_current_task();
+	mntns_id = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
+
+	return mntns_id;
+}
 
 static __always_inline int
 enter_tcp_connect(struct pt_regs *ctx, struct sock *sk)
 {
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	// mauricio beginning
+	__u64 pid_tgid = bpf_get_current_pid_tgid(); // another comment by mauricio
 	__u32 tid = pid_tgid;
 	bpf_printk("enter called");
 
 	bpf_printk("enter: setting sk for tid: %u", tid);
-	bpf_map_update_elem(&sockets, &tid, &sk, 0);
+	bpf_map_update_elem(&sockets, &tid, &sk, 0); // comment by mauricio
 	return 0;
 }
 
@@ -70,6 +94,9 @@ exit_tcp_connect(struct pt_regs *ctx, int ret)
 	bpf_printk("exit: found sk for tid: %u", tid);
 	BPF_CORE_READ_INTO(&saddr, sk, __sk_common.skc_rcv_saddr);
 	BPF_CORE_READ_INTO(&daddr, sk, __sk_common.skc_daddr);
+	BPF_CORE_READ_INTO(&hash_key.dport, sk, __sk_common.skc_dport);
+	hash_key.dport = bpf_htons(hash_key.dport);
+
 	hash_key.saddr = saddr;
 	hash_key.daddr = daddr;
 
@@ -89,13 +116,15 @@ exit_tcp_connect(struct pt_regs *ctx, int ret)
 	// Set Ringbuffer
 	struct dimensions_t *ring_val;
 
-	ring_val = bpf_ringbuf_reserve(&counter_events_ring, sizeof(struct dimensions_t), 0);
+	ring_val = bpf_ringbuf_reserve(&print_events_ring, sizeof(struct dimensions_t), 0);
 	if (!ring_val) {
 		return 0;
 	}
 
 	ring_val->saddr = saddr;
 	ring_val->daddr = daddr;
+	ring_val->dport = hash_key.dport;
+	ring_val->mnt_ns_id = gadget_get_mntns_id();
 
 	bpf_ringbuf_submit(ring_val, 0);
 
