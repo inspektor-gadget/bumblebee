@@ -24,7 +24,7 @@ type BinaryDecoder interface {
 	// If the incoming type is not a struct, it will return map[""]<type>
 	DecodeBtfBinary(
 		ctx context.Context, typ btf.Type, raw []byte,
-	) (map[string]interface{}, error)
+	) (interface{}, error)
 }
 
 type DecoderFactory func() BinaryDecoder
@@ -38,26 +38,22 @@ func newDecoder() BinaryDecoder {
 }
 
 type decoder struct {
-	// Offset within the buffer from which we are currently reading
-	offset uint32
 	// Raw binary bytes to read from
 	raw []byte
 }
 
 func (d *decoder) DecodeBtfBinary(
 	ctx context.Context, typ btf.Type, raw []byte,
-) (map[string]interface{}, error) {
+) (interface{}, error) {
 	// Reset values when called
 	d.raw = raw
-	d.offset = 0
 
 	switch typedBtf := typ.(type) {
 	case *btf.Struct:
 		// Parse the ringbuf event entry into an Event structure.
-		// buf := bytes.NewBuffer(raw)
 		result := make(map[string]interface{})
 		for _, member := range typedBtf.Members {
-			val, err := d.processSingleType(member.Type)
+			val, err := d.processSingleType(member.Type, member.Offset.Bytes())
 			if err != nil {
 				return nil, err
 			}
@@ -65,34 +61,38 @@ func (d *decoder) DecodeBtfBinary(
 		}
 		return result, nil
 	case *btf.Typedef:
-		val, err := d.processSingleType(typedBtf)
+		val, err := d.processSingleType(typedBtf, 0)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]interface{}{"": val}, nil
+		return val, nil
 	case *btf.Float:
-		val, err := d.processSingleType(typedBtf)
+		val, err := d.processSingleType(typedBtf, 0)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]interface{}{"": val}, nil
+		return val, nil
 	case *btf.Int:
-		val, err := d.processSingleType(typedBtf)
+		val, err := d.processSingleType(typedBtf, 0)
 		if err != nil {
 			return nil, err
 		}
-		return map[string]interface{}{"": val}, nil
+		return val, nil
 	default:
-		return nil, fmt.Errorf("unsupported type, %s", typedBtf.TypeName())
+		val, err := d.processSingleType(typedBtf, 0)
+		if err != nil {
+			return nil, err
+		}
+		return val, nil
 	}
 }
 
-func (d *decoder) processSingleType(typ btf.Type) (interface{}, error) {
+func (d *decoder) processSingleType(typ btf.Type, offset uint32) (interface{}, error) {
 	switch typedMember := typ.(type) {
 	case *btf.Int:
 		switch typedMember.Encoding {
 		case btf.Signed:
-			return d.handleInt(typedMember)
+			return d.handleInt(typedMember, offset)
 		case btf.Bool:
 			// TODO
 			return false, nil
@@ -101,7 +101,7 @@ func (d *decoder) processSingleType(typ btf.Type) (interface{}, error) {
 			return "", nil
 		default:
 			// Default encoding seems to be unsigned
-			return d.handleUint(typedMember)
+			return d.handleUint(typedMember, offset)
 		}
 	case *btf.Typedef:
 		// Handle special types
@@ -109,7 +109,7 @@ func (d *decoder) processSingleType(typ btf.Type) (interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
-		processed, err := d.processSingleType(underlying)
+		processed, err := d.processSingleType(underlying, offset)
 		if err != nil {
 			return nil, err
 		}
@@ -126,49 +126,55 @@ func (d *decoder) processSingleType(typ btf.Type) (interface{}, error) {
 		}
 
 	case *btf.Float:
-		return d.handleFloat(typedMember)
+		return d.handleFloat(typedMember, offset)
 	case *btf.Array:
-		return d.handleArray(typedMember)
+		return d.handleArray(typedMember, offset)
 	default:
-		return nil, fmt.Errorf("attempting to decode unsupported type, found: %s", typ.TypeName())
+		return nil, nil //fmt.Errorf("attempting to decode unsupported type, found: %s", typ.TypeName())
 	}
 }
 
 // currently only supports strings represented as char arrays
 func (d *decoder) handleArray(
 	typedMember *btf.Array,
+	offset uint32,
 ) (interface{}, error) {
-	typInt, ok := typedMember.Type.(*btf.Int)
-	if !ok {
-		return nil, errors.New("only arrays of type *btf.Int (e.g. chars) are supported")
+	typ := typedMember.Type
+
+	if typdef, ok := typ.(*btf.Typedef); ok {
+		var err error
+		typ, err = getUnderlyingType(typdef)
+		if err != nil {
+			return nil, err
+		}
 	}
-	if typInt.Name != "char" {
+
+	typInt, ok := typ.(*btf.Int)
+	if !ok {
+		return nil, fmt.Errorf("only arrays of type *btf.Int (e.g. chars) are supported. got: %T", typedMember.Type)
+	}
+	if typInt.Name != "char" && typInt.Name != "unsigned char" {
 		return nil, fmt.Errorf("only arrays with chars (i.e. strings) are supported, found '%s'", typInt.Name)
 	}
 	if typInt.Size != 1 {
 		return nil, fmt.Errorf("expected type size of 1 byte, found '%v'", typInt.Size)
 	}
 	length := int(typedMember.Nelems)
-	slice := make([]byte, length)
-	for i := 0; i < length; i++ {
-		buf := bytes.NewBuffer(d.raw[d.offset : d.offset+typInt.Size])
-		d.offset += typInt.Size
-		var val byte
-		if err := binary.Read(buf, Endianess, &val); err != nil {
-			return nil, err
-		}
-		slice[i] = val
+	b := d.raw[offset : offset+uint32(length)]
+
+	// remove trailing zeros
+	if l := bytes.IndexByte(b, 0); l != -1 && l < length {
+		return string(b[:l]), nil
 	}
-	n := bytes.IndexByte(slice, 0)
-	str := string(slice[:n])
-	return str, nil
+
+	return string(b), nil
 }
 
 func (d *decoder) handleFloat(
 	typedMember *btf.Float,
+	offset uint32,
 ) (interface{}, error) {
-	buf := bytes.NewBuffer(d.raw[d.offset : d.offset+typedMember.Size])
-	d.offset += typedMember.Size
+	buf := bytes.NewBuffer(d.raw[offset : offset+typedMember.Size])
 	switch typedMember.Size {
 	case 8:
 		var val float64
@@ -188,10 +194,10 @@ func (d *decoder) handleFloat(
 
 func (d *decoder) handleUint(
 	typedMember *btf.Int,
+	offset uint32,
 ) (interface{}, error) {
 	// Default encoding seems to be unsigned
-	buf := bytes.NewBuffer(d.raw[d.offset : d.offset+typedMember.Size])
-	d.offset += typedMember.Size
+	buf := bytes.NewBuffer(d.raw[offset : offset+typedMember.Size])
 	switch typedMember.Size * 8 {
 	case 64:
 		var val uint64
@@ -223,9 +229,9 @@ func (d *decoder) handleUint(
 
 func (d *decoder) handleInt(
 	typedMember *btf.Int,
+	offset uint32,
 ) (interface{}, error) {
-	buf := bytes.NewBuffer(d.raw[d.offset : d.offset+typedMember.Size])
-	d.offset += typedMember.Size
+	buf := bytes.NewBuffer(d.raw[offset : offset+typedMember.Size])
 	switch typedMember.Size * 8 {
 	case 64:
 		var val int64
